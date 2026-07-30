@@ -40,28 +40,32 @@
     7. :op :approve-new-representation (accepting new representation
                                always requires human sign-off).
     8. low confidence (< `confidence-floor`)."
-  (:require [legalpractice.store :as store]))
+  (:require [governor.core :as gov]
+            [legalpractice.store :as store]))
 
 (def confidence-floor 0.6)
 
 (def ^:private always-escalate-ops #{:approve-court-filing
                                      :approve-new-representation})
 
-(defn- hard-violations [{:keys [request proposal]} client-record m]
+(defn- hard-violations
+  "Rules 1-4 are the fleet-shared provenance checks, taken from
+  `kotoba-lang/governor` instead of hand-copied (they were identical in 376
+  repositories, and one of those copies had drifted — ADR-2607309100). The
+  wording stays this repo's own; only the logic is shared. Rules 5-6 are this
+  actor's domain and stay here."
+  [{:keys [request proposal]} client-record m]
   (let [{:keys [op billable-hours]} proposal
         prep? (= :approve-document-preparation op)]
-    (cond-> []
-      (nil? client-record)
-      (conj {:rule :no-client :detail "未登録 client"})
-
-      (not= :propose (:effect proposal))
-      (conj {:rule :no-actuation :detail "effect は :propose のみ許可（governor は裁判所/登記所への提出を直接実行しない）"})
-
-      (and prep? (nil? m))
-      (conj {:rule :unknown-matter :detail "未登録 matter への作業準備は不可"})
-
-      (and prep? m (not= (:client-id m) (:client-id request)))
-      (conj {:rule :matter-wrong-client :detail "matter が別 client のもの"})
+    (cond-> (gov/violations
+             (gov/missing-subject client-record {:detail "未登録 client"})
+             (gov/no-actuation
+              proposal
+              {:detail "effect は :propose のみ許可（governor は裁判所/登記所への提出を直接実行しない）"})
+             (gov/unknown-scope m {:applies? prep?
+                                   :detail "未登録 matter への作業準備は不可"})
+             (when prep?
+               (gov/scope-owner-mismatch m request {:detail "matter が別 client のもの"})))
 
       (and prep? m (number? billable-hours) (> billable-hours (:max-billable-hours m)))
       (conj {:rule :billable-hours-exceeds-scope
@@ -76,17 +80,12 @@
   "Assess a proposal against `request`/`context`/`proposal` and a
   `store` implementing `legalpractice.store/Store`. Pure — never
   mutates the store, never files or submits to a court/registry."
-  [request context proposal store]
+  [request _context proposal store]
   (let [client-record (store/client store (:client-id request))
-        m (some->> (:matter-id proposal) (store/matter store))
-        hard (hard-violations {:request request :proposal proposal}
-                              client-record m)
-        hard? (boolean (seq hard))
-        conf (or (:confidence proposal) 0.0)
-        low? (< conf confidence-floor)
-        always-risky? (contains? always-escalate-ops (:op proposal))]
-    {:ok? (and (not hard?) (not low?) (not always-risky?))
-     :violations hard
-     :confidence conf
-     :hard? hard?
-     :escalate? (and (not hard?) (or low? always-risky?))}))
+        m (some->> (:matter-id proposal) (store/matter store))]
+    (gov/verdict
+     {:violations (hard-violations {:request request :proposal proposal}
+                                   client-record m)
+      :confidence (:confidence proposal)
+      :confidence-floor confidence-floor
+      :escalating-op? (contains? always-escalate-ops (:op proposal))})))
