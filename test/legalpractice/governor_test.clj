@@ -1,5 +1,6 @@
 (ns legalpractice.governor-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [governor.core :as gov]
+            [clojure.test :refer [deftest is testing]]
             [legalpractice.store :as store]
             [legalpractice.governor :as governor]))
 
@@ -94,3 +95,33 @@
         v (governor/check req {} (assoc (prep-op 20) :confidence 0.3) st)]
     (is (not (:hard? v)))
     (is (:escalate? v))))
+
+(deftest every-verdict-is-well-formed
+  (testing "conformance against kotoba-lang/governor — the property, not the literal.
+            A verdict that says a HARD hold is escalatable would fail here even
+            though the graph would still route it to :hold (ADR-2607309100)."
+    (let [s (fresh-store)
+          proposals [{:op :approve-document-preparation :effect :propose
+                      :matter-id "M-1" :billable-hours 8 :confidence 0.9}
+                     {:op :approve-document-preparation :effect :propose
+                      :matter-id "M-1" :billable-hours 8 :confidence 0.2}
+                     {:op :approve-document-preparation :effect :propose
+                      :matter-id "M-1" :billable-hours 999 :confidence 0.9}
+                     {:op :approve-document-preparation :effect :execute
+                      :matter-id "M-1" :billable-hours 8 :confidence 0.9}
+                     {:op :approve-document-preparation :effect :propose
+                      :matter-id "M-404" :billable-hours 8 :confidence 0.9}
+                     {:op :approve-court-filing :effect :propose :confidence 1.0}
+                     {:op :approve-new-representation :effect :propose :confidence 1.0}]]
+      (doseq [p proposals]
+        (let [v (governor/check {:client-id "client-1"} {} p s)]
+          (is (empty? (gov/conformance-failures v))
+              (str (:op p) "/" (:effect p) " → "
+                   (pr-str (gov/conformance-failures v)))))))
+    (testing "and the two always-escalate ops never auto-commit at any confidence"
+      (let [s (fresh-store)]
+        (doseq [op [:approve-court-filing :approve-new-representation]]
+          (let [v (governor/check {:client-id "client-1"} {}
+                                  {:op op :effect :propose :confidence 1.0} s)]
+            (is (false? (:ok? v)) (str op))
+            (is (= :counsel-decision (:escalation-reason v)) (str op))))))))
